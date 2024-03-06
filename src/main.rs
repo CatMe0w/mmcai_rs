@@ -6,7 +6,6 @@ use std::{
     process::{self, Stdio},
 };
 
-extern crate reqwest;
 use base64::prelude::*;
 use rand::{thread_rng, Rng};
 use reqwest::header;

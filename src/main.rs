@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     env, fs,
     io::{self, BufRead, Write},
     path::PathBuf,
@@ -7,13 +6,31 @@ use std::{
 };
 
 use base64::prelude::*;
-use rand::{thread_rng, Rng};
+use rand::{Rng, thread_rng};
+use reqwest::Error as ReqwestError;
 use reqwest::header;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+mod errors;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthRequest<'a> {
+    username: &'a str,
+    password: &'a str,
+    request_user: bool,
+    client_token: &'a str,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthResponse {
+    access_token: String,
+    selected_profile: Profile,
+}
+
+struct LoginResult {
+    prefetched: String,
     access_token: String,
     selected_profile: Profile,
 }
@@ -24,42 +41,90 @@ struct Profile {
     name: String,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn check_args(args: &Vec<String>) -> Result<(), errors::MmcaiError> {
+    match args.len() {
+        len if len < 4 => Err(errors::MmcaiError::WrongUsage(args[0].to_owned())),
+        4 => Err(errors::MmcaiError::RunDirectly),
+        _ => Ok(()),
+    }
+}
+
+fn find_authlib_injector() -> Option<PathBuf> {
+    let current_exe = env::current_exe().ok()?;
+    let exe_dir = current_exe.parent()?;
+    let is_filename_valid = |filename: &str| {
+        filename.starts_with("authlib-injector") && filename.ends_with(".jar")
+    };
+
+    fs::read_dir(exe_dir).ok().and_then(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .find(|entry| {
+                let file_name = entry.file_name();
+                file_name.to_str().map_or(false, is_filename_valid)
+            })
+            .map(|entry| entry.path())
+    })
+}
+
+fn get_rnd_client_token() -> String {
+    let mut rng = thread_rng();
+    let mut buffer = [0u8; 128];
+    rng.fill(&mut buffer);
+    let base64_encoded = BASE64_STANDARD.encode(&buffer);
+    base64_encoded[..128].to_string()
+}
+
+fn login_yggdrasil(
+    username: &str,
+    password: &str,
+    client_token: &str,
+    api_url: &str,
+) -> Result<LoginResult, errors::MmcaiError> {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(errors::MmcaiError::ReqwestClientBuildFailed)?;
+
+    let get_prefetched = || -> Result<String, ReqwestError> {
+        let prefetched = client.get(api_url).send()?.text()?;
+        Ok(prefetched)
+    };
+
+    let get_authenticate = || -> Result<AuthResponse, ReqwestError> {
+        let mut headers = header::HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+
+        let body = AuthRequest {
+            username,
+            password,
+            request_user: true,
+            client_token,
+        };
+
+        Ok(client
+            .post(format!("{}/authserver/authenticate", api_url))
+            .headers(headers)
+            .json(&body)
+            .send()?
+            .json::<AuthResponse>()?)
+    };
+
+    let prefetched = get_prefetched().map_err(errors::MmcaiError::PrefetchFailed)?;
+    let auth_response = get_authenticate().map_err(errors::MmcaiError::AuthFailed)?;
+
+    Ok(LoginResult {
+        prefetched,
+        access_token: auth_response.access_token,
+        selected_profile: auth_response.selected_profile,
+    })
+}
+
+fn main() -> Result<(), errors::MmcaiError> {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 4 {
-        eprintln!("Usage: {} <username> <password> <api url>", args[0]);
-        process::exit(1);
-    }
+    check_args(&args)?;
 
-    if args.len() == 4 {
-        eprintln!("Looks like you have entered a valid command, but you can't run mmcai_rs directly! Put your command in \"Wrapper command\" in Prism Launcher.");
-        process::exit(1);
-    }
-
-    // find authlib injector
-    let current_exe = env::current_exe()?;
-    let exe_dir = current_exe.parent().unwrap();
-    let mut authlib_injector_path: PathBuf = PathBuf::new();
-
-    if let Ok(entries) = fs::read_dir(exe_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let file_name = entry.file_name();
-                if let Some(file_name) = file_name.to_str() {
-                    if file_name.starts_with("authlib-injector") && file_name.ends_with(".jar") {
-                        authlib_injector_path = entry.path();
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if authlib_injector_path == PathBuf::new() {
-        eprintln!("[mmcai_rs] authlib-injector not found in the same directory as mmcai_rs!");
-        process::exit(1);
-    }
+    let authlib_injector_path = find_authlib_injector().ok_or(errors::MmcaiError::AuthlibInjectorNotFound)?;
 
     println!(
         "[mmcai_rs] authlib-injector found at {:?}, logging in...",
@@ -71,125 +136,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let password = &args[2];
     let api_url = &args[3];
 
-    let mut rng = thread_rng();
-    let mut buffer = [0u8; 128];
-    rng.fill(&mut buffer);
-    let base64_encoded = BASE64_STANDARD.encode(&buffer);
-    let client_token = &base64_encoded[..128];
+    let client_token = get_rnd_client_token();
 
-    let mut headers = header::HeaderMap::new();
-    headers.insert("Content-Type", "application/json".parse().unwrap());
-
-    let mut body: HashMap<&str, &str> = HashMap::new();
-    body.insert("username", username);
-    body.insert("password", password);
-    body.insert("requestUser", "true");
-    body.insert("clientToken", client_token);
-
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-
-    let hello_response_text = client.get(api_url).send()?.text()?;
-
-    let auth_response = client
-        .post(format!("{}/authserver/authenticate", api_url))
-        .headers(headers)
-        .json(&body)
-        .send()?
-        .json::<AuthResponse>()?;
+    let login_result = login_yggdrasil(username, password, &client_token, api_url)?;
 
     println!(
         "[mmcai_rs] Successfully authenticated as {}",
-        auth_response.selected_profile.name
+        login_result.selected_profile.name
     );
 
     // minecraft params
-    let mut minecraft_params: Vec<String> = Vec::new();
-
     let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = &line.expect("Failed to read Minecraft params");
 
-        minecraft_params.push(line.clone());
+    let access_token = login_result.access_token;
+    let profile_id = login_result.selected_profile.id;
+    let profile_name = login_result.selected_profile.name;
 
-        if line.trim() == "launch" {
-            break;
+    let convert_next_line = |line: String| match line {
+        line if line.contains("param --username") => Some(format!("param {}", profile_name)),
+        line if line.contains("param --uuid") => Some(format!("param {}", profile_id)),
+        line if line.contains("param --accessToken") => Some(format!("param {}", access_token)),
+        line if line.contains("userName ") => Some(format!("userName {}", profile_name)),
+        line if line.contains("sessionId ") => Some(format!("sessionId token:{}", access_token)),
+        _ => None,
+    };
+    let mut minecraft_params: Vec<String> = stdin.lock().lines()
+        .take_while(|line| match line {
+            Ok(line) => line.trim_end() != "launch",
+            Err(_) => false,
+        })
+        .collect::<Result<_, _>>().map_err(errors::MmcaiError::ParseMinecraftParamsFailed)?;
+    minecraft_params.iter().enumerate().filter_map(|(index, line)| {
+        if let Some(converted) = convert_next_line(line.to_owned()) {
+            Some((index + 1, converted))
+        } else {
+            None
         }
-    }
-
-    let access_token = auth_response.access_token;
-    let uuid = auth_response.selected_profile.id;
-    let playername = auth_response.selected_profile.name;
-
-    for index in 0..minecraft_params.len() {
-        if minecraft_params[index].contains("param --username") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", playername).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("param --uuid") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", uuid).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("param --accessToken") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", access_token).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("userName ") {
-            if let Some(this_line) = minecraft_params.get_mut(index) {
-                *this_line = format!("userName {}", playername).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("sessionId ") {
-            if let Some(this_line) = minecraft_params.get_mut(index) {
-                *this_line = format!("sessionId token:{}", access_token).to_string();
-            }
-        }
-    }
+    })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|(index, converted)| minecraft_params[index] = converted);
 
     // ready to launch
-    let prefetched_data = BASE64_STANDARD.encode(hello_response_text);
-    let java_executable = env::var("INST_JAVA").unwrap();
-    let mut jvm_args = Vec::from(&args[5..]);
-    jvm_args.insert(
-        0,
-        format!(
-            "-javaagent:{}={}",
-            authlib_injector_path.to_str().unwrap(),
-            api_url
-        ),
+    let prefetched_data = BASE64_STANDARD.encode(login_result.prefetched);
+    let java_executable = env::var("INST_JAVA").map_err(|_| errors::MmcaiError::EnvVarNotFound("INST_JAVA".to_owned()))?;
+    let javaagent_arg = format!(
+        "-javaagent:{}={}",
+        authlib_injector_path.to_str().ok_or(errors::MmcaiError::Other)?,
+        api_url
     );
-    jvm_args.insert(
-        1,
-        format!("-Dauthlibinjector.yggdrasil.prefetched={}", prefetched_data),
+    let prefetched_arg = format!("-Dauthlibinjector.yggdrasil.prefetched={}", prefetched_data);
+    let jvm_args_iter = args.iter().skip(5).chain(
+        std::iter::once(&javaagent_arg)
+    ).chain(
+        std::iter::once(&prefetched_arg)
     );
 
     let mut command = process::Command::new(java_executable);
-    command.args(jvm_args);
+    command.args(jvm_args_iter);
 
-    if let Ok(mut child) = command
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .spawn()
-    {
-        let child_stdin = &mut child.stdin;
+        .map_err(errors::MmcaiError::SpawnProcessFailed)?;
 
-        if let Some(stdin) = child_stdin {
-            for line in minecraft_params {
-                writeln!(stdin, "{}", line).expect("Failed to write Minecraft params");
-            }
-        }
+    let stdin = (&mut child.stdin).as_mut().ok_or(errors::MmcaiError::StdinNotFoundFailed)?;
 
-        let _ = child.wait();
+    minecraft_params.iter().map(|line| {
+        stdin.write_all(line.as_bytes()).map_err(errors::MmcaiError::WriteMinecraftParamsFailed)
+    }).take_while(Result::is_ok).collect::<Result<_, _>>()?;
+
+    let status = child.wait().map_err(|_| errors::MmcaiError::Other)?;
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
     }
-
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use fake::{Fake, Faker};
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use super::*;
+    
+    fn get_fake_args(length: usize) -> Vec<String> {
+        let seed = [
+            1, 0, 0, 0, 23, 0, 0, 0, 200, 1, 0, 0, 210, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let ref mut r = StdRng::from_seed(seed);
+        (0..length).map(|_| Faker.fake_with_rng::<String, _>(r)).collect()
+    }
+    
+    #[test]
+    fn test_check_args() {
+        assert!(matches!(check_args(&get_fake_args(1)), Err(errors::MmcaiError::WrongUsage(_))));
+        assert!(matches!(check_args(&get_fake_args(2)), Err(errors::MmcaiError::WrongUsage(_))));
+        assert!(matches!(check_args(&get_fake_args(3)), Err(errors::MmcaiError::WrongUsage(_))));
+        assert!(matches!(check_args(&get_fake_args(4)), Err(errors::MmcaiError::RunDirectly)));
+        assert!(matches!(check_args(&get_fake_args(5)), Ok(())));
+    }
+    
+    #[test]
+    fn test_get_rnd_client_token() {
+        for _ in 0..1000 {
+            let token = get_rnd_client_token();
+            assert_eq!(token.len(), 128);
+        }
+    }
 }

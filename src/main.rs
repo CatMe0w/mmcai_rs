@@ -4,12 +4,14 @@ use std::{
     path::PathBuf,
     process::{self, Stdio},
 };
+use std::collections::HashMap;
 
 use base64::prelude::*;
 use rand::{Rng, thread_rng};
 use reqwest::Error as ReqwestError;
 use reqwest::header;
 use serde::{Deserialize, Serialize};
+use crate::errors::MmcaiError;
 
 mod errors;
 
@@ -41,10 +43,10 @@ struct Profile {
     name: String,
 }
 
-fn check_args(args: &Vec<String>) -> Result<(), errors::MmcaiError> {
+fn check_args(args: &Vec<String>) -> Result<(), MmcaiError> {
     match args.len() {
-        len if len < 4 => Err(errors::MmcaiError::WrongUsage(args[0].to_owned())),
-        4 => Err(errors::MmcaiError::RunDirectly),
+        len if len < 4 => Err(MmcaiError::WrongUsage(args[0].to_owned())),
+        4 => Err(MmcaiError::RunDirectly),
         _ => Ok(()),
     }
 }
@@ -80,10 +82,10 @@ fn login_yggdrasil(
     password: &str,
     client_token: &str,
     api_url: &str,
-) -> Result<LoginResult, errors::MmcaiError> {
+) -> Result<LoginResult, MmcaiError> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .build().map_err(errors::MmcaiError::ReqwestClientBuildFailed)?;
+        .build().map_err(MmcaiError::ReqwestClientBuildFailed)?;
 
     let get_prefetched = || -> Result<String, ReqwestError> {
         let prefetched = client.get(api_url).send()?.text()?;
@@ -109,8 +111,8 @@ fn login_yggdrasil(
             .json::<AuthResponse>()?)
     };
 
-    let prefetched = get_prefetched().map_err(errors::MmcaiError::PrefetchFailed)?;
-    let auth_response = get_authenticate().map_err(errors::MmcaiError::AuthFailed)?;
+    let prefetched = get_prefetched().map_err(MmcaiError::PrefetchFailed)?;
+    let auth_response = get_authenticate().map_err(MmcaiError::AuthFailed)?;
 
     Ok(LoginResult {
         prefetched,
@@ -119,12 +121,12 @@ fn login_yggdrasil(
     })
 }
 
-fn main() -> Result<(), errors::MmcaiError> {
+fn main() -> Result<(), MmcaiError> {
     let args: Vec<String> = env::args().collect();
 
     check_args(&args)?;
 
-    let authlib_injector_path = find_authlib_injector().ok_or(errors::MmcaiError::AuthlibInjectorNotFound)?;
+    let authlib_injector_path = find_authlib_injector().ok_or(MmcaiError::AuthlibInjectorNotFound)?;
 
     println!(
         "[mmcai_rs] authlib-injector found at {:?}, logging in...",
@@ -152,7 +154,7 @@ fn main() -> Result<(), errors::MmcaiError> {
     let profile_id = login_result.selected_profile.id;
     let profile_name = login_result.selected_profile.name;
 
-    let convert_next_line = |line: String| match line {
+    let convert_next_line = |line: &str| match line {
         line if line.contains("param --username") => Some(format!("param {}", profile_name)),
         line if line.contains("param --uuid") => Some(format!("param {}", profile_id)),
         line if line.contains("param --accessToken") => Some(format!("param {}", access_token)),
@@ -160,29 +162,33 @@ fn main() -> Result<(), errors::MmcaiError> {
         line if line.contains("sessionId ") => Some(format!("sessionId token:{}", access_token)),
         _ => None,
     };
-    let mut minecraft_params: Vec<String> = stdin.lock().lines()
+    let mut modify_items: HashMap<usize, String> = HashMap::new();
+    let minecraft_params = stdin.lock().lines()
         .take_while(|line| match line {
             Ok(line) => line.trim_end() != "launch",
             Err(_) => false,
         })
-        .collect::<Result<_, _>>().map_err(errors::MmcaiError::ParseMinecraftParamsFailed)?;
-    minecraft_params.iter().enumerate().filter_map(|(index, line)| {
-        if let Some(converted) = convert_next_line(line.to_owned()) {
-            Some((index + 1, converted))
-        } else {
-            None
-        }
-    })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .for_each(|(index, converted)| minecraft_params[index] = converted);
+        .chain(std::iter::once(Ok("launch".to_owned())))
+        .enumerate()
+        .map::<Result<String, MmcaiError>, _>(|(index, line)| {
+            let line = line.map_err(|_| MmcaiError::Other)?;
+            match modify_items.remove(&(index + 1)) { 
+                Some(modified) => Ok(modified),
+                None => {
+                    if let Some(converted) = convert_next_line(line.as_str()) {
+                        modify_items.insert(index + 1, converted.clone());
+                    };
+                    Ok(line)
+                }
+            }
+        });
 
     // ready to launch
     let prefetched_data = BASE64_STANDARD.encode(login_result.prefetched);
-    let java_executable = env::var("INST_JAVA").map_err(|_| errors::MmcaiError::EnvVarNotFound("INST_JAVA".to_owned()))?;
+    let java_executable = env::var("INST_JAVA").map_err(|_| MmcaiError::EnvVarNotFound("INST_JAVA".to_owned()))?;
     let javaagent_arg = format!(
         "-javaagent:{}={}",
-        authlib_injector_path.to_str().ok_or(errors::MmcaiError::Other)?,
+        authlib_injector_path.to_str().ok_or(MmcaiError::Other)?,
         api_url
     );
     let prefetched_arg = format!("-Dauthlibinjector.yggdrasil.prefetched={}", prefetched_data);
@@ -199,15 +205,16 @@ fn main() -> Result<(), errors::MmcaiError> {
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .spawn()
-        .map_err(errors::MmcaiError::SpawnProcessFailed)?;
+        .map_err(MmcaiError::SpawnProcessFailed)?;
 
-    let stdin = (&mut child.stdin).as_mut().ok_or(errors::MmcaiError::StdinNotFoundFailed)?;
+    let stdin = (&mut child.stdin).as_mut().ok_or(MmcaiError::StdinNotFoundFailed)?;
 
-    minecraft_params.iter().map(|line| {
-        stdin.write_all(line.as_bytes()).map_err(errors::MmcaiError::WriteMinecraftParamsFailed)
+    minecraft_params.map(|line| {
+        let line = line?;
+        stdin.write_all(line.as_bytes()).map_err(MmcaiError::WriteMinecraftParamsFailed)
     }).take_while(Result::is_ok).collect::<Result<_, _>>()?;
 
-    let status = child.wait().map_err(|_| errors::MmcaiError::Other)?;
+    let status = child.wait().map_err(|_| MmcaiError::Other)?;
     if !status.success() {
         process::exit(status.code().unwrap_or(1));
     }
@@ -232,10 +239,10 @@ mod tests {
     
     #[test]
     fn test_check_args() {
-        assert!(matches!(check_args(&get_fake_args(1)), Err(errors::MmcaiError::WrongUsage(_))));
-        assert!(matches!(check_args(&get_fake_args(2)), Err(errors::MmcaiError::WrongUsage(_))));
-        assert!(matches!(check_args(&get_fake_args(3)), Err(errors::MmcaiError::WrongUsage(_))));
-        assert!(matches!(check_args(&get_fake_args(4)), Err(errors::MmcaiError::RunDirectly)));
+        assert!(matches!(check_args(&get_fake_args(1)), Err(MmcaiError::WrongUsage(_))));
+        assert!(matches!(check_args(&get_fake_args(2)), Err(MmcaiError::WrongUsage(_))));
+        assert!(matches!(check_args(&get_fake_args(3)), Err(MmcaiError::WrongUsage(_))));
+        assert!(matches!(check_args(&get_fake_args(4)), Err(MmcaiError::RunDirectly)));
         assert!(matches!(check_args(&get_fake_args(5)), Ok(())));
     }
     

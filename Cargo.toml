@@ -18,4 +18,5 @@ thiserror = "1.0.57"
 uuid = { version = "1.7.0", features = ["v4"] }
 
 [dev-dependencies]
+assert_fs = "1.1.1"
 fake = "2.9.2"

@@ -1,18 +1,23 @@
+use io::Result as IoResult;
 use std::{
     env, fs,
     io::{self, BufRead, Write},
     path::PathBuf,
     process::{self, Stdio},
 };
+use std::path::Path;
 
-use crate::errors::MmcaiError;
 use base64::prelude::*;
 use reqwest::header;
-use reqwest::Error as ReqwestError;
+use reqwest::Result as ReqwestResult;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::errors::MmcaiError;
+
 mod errors;
+
+pub type Result<T> = std::result::Result<T, MmcaiError>;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,7 +47,7 @@ struct LoginResult {
     selected_profile: Profile,
 }
 
-fn validate_args(args: &Vec<String>) -> Result<(), MmcaiError> {
+fn validate_args(args: &Vec<String>) -> Result<()> {
     match args.len() {
         len if len < 4 => Err(MmcaiError::InvalidArgument(args[0].to_owned())),
         4 => Err(MmcaiError::CannotRunDirectly),
@@ -50,15 +55,21 @@ fn validate_args(args: &Vec<String>) -> Result<(), MmcaiError> {
     }
 }
 
-fn find_authlib_injector() -> Option<PathBuf> {
-    let current_exe = env::current_exe().ok()?;
-    let exe_dir = current_exe.parent()?;
+fn find_authlib_injector(path: Option<&Path>) -> Option<PathBuf> {
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let exe_path = env::current_exe().ok()?;
+            exe_path.parent()?.to_path_buf()
+        }
+    };
+
     let is_filename_valid =
         |filename: &str| filename.starts_with("authlib-injector") && filename.ends_with(".jar");
 
-    fs::read_dir(exe_dir).ok().and_then(|entries| {
+    fs::read_dir(path).ok().and_then(|entries| {
         entries
-            .filter_map(Result::ok)
+            .filter_map(IoResult::ok)
             .find(|entry| {
                 let file_name = entry.file_name();
                 file_name.to_str().map_or(false, is_filename_valid)
@@ -76,18 +87,18 @@ fn yggdrasil_login(
     password: &str,
     client_token: &str,
     api_url: &str,
-) -> Result<LoginResult, MmcaiError> {
+) -> Result<LoginResult> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(MmcaiError::ReqwestClientBuildFailed)?;
 
-    let get_prefetched_data = || -> Result<String, ReqwestError> {
+    let get_prefetched_data = || -> ReqwestResult<String> {
         let prefetched_data_text = client.get(api_url).send()?.text()?;
         Ok(BASE64_STANDARD.encode(prefetched_data_text))
     };
 
-    let perform_authentication = || -> Result<AuthResponse, ReqwestError> {
+    let perform_authentication = || -> ReqwestResult<AuthResponse> {
         let mut headers = header::HeaderMap::new();
         headers.insert("Content-Type", "application/json".parse().unwrap());
 
@@ -116,14 +127,48 @@ fn yggdrasil_login(
     })
 }
 
-fn main() -> Result<(), MmcaiError> {
+fn modify_minecraft_params(
+    minecraft_params: &mut Vec<String>,
+    access_token: &str,
+    uuid: &str,
+    playername: &str,
+) -> Result<()> {
+    for index in 0..minecraft_params.len() {
+        match minecraft_params[index].as_str() {
+            line if line.contains("param --username") => {
+                *minecraft_params.get_mut(index + 1).ok_or(MmcaiError::Other)? =
+                    format!("param {}", playername).to_string();
+            }
+            line if line.contains("param --uuid") => {
+                *minecraft_params.get_mut(index + 1).ok_or(MmcaiError::Other)? =
+                    format!("param {}", uuid).to_string();
+            }
+            line if line.contains("param --accessToken") => {
+                *minecraft_params.get_mut(index + 1).ok_or(MmcaiError::Other)? =
+                    format!("param {}", access_token).to_string();
+            }
+            line if line.contains("userName ") => {
+                *minecraft_params.get_mut(index).ok_or(MmcaiError::Other)? =
+                    format!("userName {}", playername).to_string();
+            }
+            line if line.contains("sessionId ") => {
+                *minecraft_params.get_mut(index).ok_or(MmcaiError::Other)? =
+                    format!("sessionId token:{}", access_token).to_string();
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     validate_args(&args)?;
 
     // find authlib-injector
     let authlib_injector_path =
-        find_authlib_injector().ok_or(MmcaiError::AuthlibInjectorNotFound)?;
+        find_authlib_injector(None).ok_or(MmcaiError::AuthlibInjectorNotFound)?;
 
     println!(
         "[mmcai_rs] authlib-injector found at {:?}, logging in...",
@@ -149,11 +194,9 @@ fn main() -> Result<(), MmcaiError> {
 
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
-        let line = &line.map_err(MmcaiError::ReadMinecraftParamsFailed)?;
-
+        let line = line.map_err(MmcaiError::ReadMinecraftParamsFailed)?.trim().to_string();
         minecraft_params.push(line.clone());
-
-        if line.trim() == "launch" {
+        if line == "launch" {
             break;
         }
     }
@@ -162,37 +205,7 @@ fn main() -> Result<(), MmcaiError> {
     let uuid = login_result.selected_profile.id;
     let playername = login_result.selected_profile.name;
 
-    for index in 0..minecraft_params.len() {
-        if minecraft_params[index].contains("param --username") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", playername).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("param --uuid") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", uuid).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("param --accessToken") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", access_token).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("userName ") {
-            if let Some(this_line) = minecraft_params.get_mut(index) {
-                *this_line = format!("userName {}", playername).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("sessionId ") {
-            if let Some(this_line) = minecraft_params.get_mut(index) {
-                *this_line = format!("sessionId token:{}", access_token).to_string();
-            }
-        }
-    }
+    modify_minecraft_params(&mut minecraft_params, &access_token, &uuid, &playername)?;
 
     // ready to launch
     let java_executable = env::var("INST_JAVA").map_err(|_| MmcaiError::JavaExecutableNotFound)?;
@@ -250,10 +263,12 @@ fn main() -> Result<(), MmcaiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use assert_fs::prelude::{FileTouch, PathChild};
     use fake::{Fake, Faker};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    use super::*;
 
     fn get_fake_args(length: usize) -> Vec<String> {
         let seed = [
@@ -267,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_check_args() {
+    fn test_validate_args() {
         assert!(matches!(
             validate_args(&get_fake_args(1)),
             Err(MmcaiError::InvalidArgument(_))
@@ -288,9 +303,68 @@ mod tests {
     }
 
     #[test]
-    fn test_get_rnd_client_token() {
+    fn test_generate_client_token() {
         let client_token = generate_client_token();
         assert_eq!(client_token.len(), 36);
+    }
+
+    #[test]
+    fn test_find_authlib_injector() {
+        let test_find_authlib_injector_with_filename = |filename: &str, should_exist: bool| {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let input_file = temp_dir.child(filename);
+            input_file.touch().unwrap();
+            if should_exist {
+                assert_eq!(
+                    find_authlib_injector(Some(&temp_dir)).unwrap(),
+                    input_file.path()
+                );
+            } else {
+                assert!(find_authlib_injector(Some(&temp_dir)).is_none());
+            }
+            temp_dir.close().unwrap();
+        };
+
+        test_find_authlib_injector_with_filename("authlib-injector-1.0.0.jar", true);
+        test_find_authlib_injector_with_filename("authlib-injector-1.0.0.zip", false);
+        test_find_authlib_injector_with_filename("authlib-injector-1.0.0", false);
+        test_find_authlib_injector_with_filename("authlib-injector-.catch.me.if.you.can.jar", true);
+        test_find_authlib_injector_with_filename("not-start-with.authlib-injector.jar", false);
+        test_find_authlib_injector_with_filename("authlib-injector.jar.not-end-with", false);
+    }
+
+    #[test]
+    fn test_modify_minecraft_params() {
+        let mut minecraft_params = vec![
+            "---START---".to_string(),
+            "param --username".to_string(),
+            "param AnyHow".to_string(),
+            "param --uuid".to_string(),
+            "param AnyHow".to_string(),
+            "param --accessToken".to_string(),
+            "param AnyHow".to_string(),
+            "userName AnyHow".to_string(),
+            "sessionId AnyHow".to_string(),
+            "launch".to_string(),
+            "---END---".to_string(),
+        ];
+        let access_token = "TEST_ACCESS_TOKEN";
+        let uuid = "TEST_UUID";
+        let playername = "TEST_PLAYERNAME";
+        modify_minecraft_params(&mut minecraft_params, access_token, uuid, playername).unwrap();
+        assert_eq!(minecraft_params, vec![
+            "---START---".to_string(),
+            "param --username".to_string(),
+            "param TEST_PLAYERNAME".to_string(),
+            "param --uuid".to_string(),
+            "param TEST_UUID".to_string(),
+            "param --accessToken".to_string(),
+            "param TEST_ACCESS_TOKEN".to_string(),
+            "userName TEST_PLAYERNAME".to_string(),
+            "sessionId token:TEST_ACCESS_TOKEN".to_string(),
+            "launch".to_string(),
+            "---END---".to_string(),
+        ]);
     }
 
     // XXX: key features are not tested

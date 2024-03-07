@@ -7,10 +7,10 @@ use std::{
 
 use crate::errors::MmcaiError;
 use base64::prelude::*;
-use rand::{thread_rng, Rng};
 use reqwest::header;
 use reqwest::Error as ReqwestError;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 mod errors;
 
@@ -68,11 +68,7 @@ fn find_authlib_injector() -> Option<PathBuf> {
 }
 
 fn generate_client_token() -> String {
-    let mut rng = thread_rng();
-    let mut buffer = [0u8; 128];
-    rng.fill(&mut buffer);
-    let base64_encoded = BASE64_STANDARD.encode(&buffer);
-    base64_encoded[..128].to_string()
+    Uuid::new_v4().to_string()
 }
 
 fn yggdrasil_login(
@@ -293,10 +289,8 @@ mod tests {
 
     #[test]
     fn test_get_rnd_client_token() {
-        for _ in 0..1000 {
-            let token = generate_client_token();
-            assert_eq!(token.len(), 128);
-        }
+        let client_token = generate_client_token();
+        assert_eq!(client_token.len(), 36);
     }
 
     // XXX: key features are not tested

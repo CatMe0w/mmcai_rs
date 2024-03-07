@@ -1,11 +1,11 @@
 use io::Result as IoResult;
+use std::path::Path;
 use std::{
     env, fs,
     io::{self, BufRead, Write},
     path::PathBuf,
     process::{self, Stdio},
 };
-use std::path::Path;
 
 use base64::prelude::*;
 use reqwest::header;
@@ -136,16 +136,19 @@ fn modify_minecraft_params(
     for index in 0..minecraft_params.len() {
         match minecraft_params[index].as_str() {
             line if line.contains("param --username") => {
-                *minecraft_params.get_mut(index + 1).ok_or(MmcaiError::Other)? =
-                    format!("param {}", playername).to_string();
+                *minecraft_params
+                    .get_mut(index + 1)
+                    .ok_or(MmcaiError::Other)? = format!("param {}", playername).to_string();
             }
             line if line.contains("param --uuid") => {
-                *minecraft_params.get_mut(index + 1).ok_or(MmcaiError::Other)? =
-                    format!("param {}", uuid).to_string();
+                *minecraft_params
+                    .get_mut(index + 1)
+                    .ok_or(MmcaiError::Other)? = format!("param {}", uuid).to_string();
             }
             line if line.contains("param --accessToken") => {
-                *minecraft_params.get_mut(index + 1).ok_or(MmcaiError::Other)? =
-                    format!("param {}", access_token).to_string();
+                *minecraft_params
+                    .get_mut(index + 1)
+                    .ok_or(MmcaiError::Other)? = format!("param {}", access_token).to_string();
             }
             line if line.contains("userName ") => {
                 *minecraft_params.get_mut(index).ok_or(MmcaiError::Other)? =
@@ -194,7 +197,10 @@ fn main() -> Result<()> {
 
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
-        let line = line.map_err(MmcaiError::ReadMinecraftParamsFailed)?.trim().to_string();
+        let line = line
+            .map_err(MmcaiError::ReadMinecraftParamsFailed)?
+            .trim()
+            .to_string();
         minecraft_params.push(line.clone());
         if line == "launch" {
             break;
@@ -352,19 +358,22 @@ mod tests {
         let uuid = "TEST_UUID";
         let playername = "TEST_PLAYERNAME";
         modify_minecraft_params(&mut minecraft_params, access_token, uuid, playername).unwrap();
-        assert_eq!(minecraft_params, vec![
-            "---START---".to_string(),
-            "param --username".to_string(),
-            "param TEST_PLAYERNAME".to_string(),
-            "param --uuid".to_string(),
-            "param TEST_UUID".to_string(),
-            "param --accessToken".to_string(),
-            "param TEST_ACCESS_TOKEN".to_string(),
-            "userName TEST_PLAYERNAME".to_string(),
-            "sessionId token:TEST_ACCESS_TOKEN".to_string(),
-            "launch".to_string(),
-            "---END---".to_string(),
-        ]);
+        assert_eq!(
+            minecraft_params,
+            vec![
+                "---START---".to_string(),
+                "param --username".to_string(),
+                "param TEST_PLAYERNAME".to_string(),
+                "param --uuid".to_string(),
+                "param TEST_UUID".to_string(),
+                "param --accessToken".to_string(),
+                "param TEST_ACCESS_TOKEN".to_string(),
+                "userName TEST_PLAYERNAME".to_string(),
+                "sessionId token:TEST_ACCESS_TOKEN".to_string(),
+                "launch".to_string(),
+                "---END---".to_string(),
+            ]
+        );
     }
 
     // XXX: key features are not tested

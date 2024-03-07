@@ -1,16 +1,32 @@
+use io::Result as IoResult;
+use std::path::Path;
 use std::{
-    collections::HashMap,
     env, fs,
     io::{self, BufRead, Write},
     path::PathBuf,
     process::{self, Stdio},
 };
 
-extern crate reqwest;
 use base64::prelude::*;
-use rand::{thread_rng, Rng};
 use reqwest::header;
-use serde::Deserialize;
+use reqwest::Result as ReqwestResult;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::errors::MmcaiError;
+
+mod errors;
+
+pub type Result<T> = std::result::Result<T, MmcaiError>;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthRequest<'a> {
+    username: &'a str,
+    password: &'a str,
+    request_user: bool,
+    client_token: &'a str,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,42 +41,137 @@ struct Profile {
     name: String,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
+struct LoginResult {
+    prefetched_data: String,
+    access_token: String,
+    selected_profile: Profile,
+}
 
-    if args.len() < 4 {
-        eprintln!("Usage: {} <username> <password> <api url>", args[0]);
-        process::exit(1);
+fn validate_args(args: &Vec<String>) -> Result<()> {
+    match args.len() {
+        len if len < 4 => Err(MmcaiError::InvalidArgument(args[0].to_owned())),
+        4 => Err(MmcaiError::CannotRunDirectly),
+        _ => Ok(()),
     }
+}
 
-    if args.len() == 4 {
-        eprintln!("Looks like you have entered a valid command, but you can't run mmcai_rs directly! Put your command in \"Wrapper command\" in Prism Launcher.");
-        process::exit(1);
-    }
+fn find_authlib_injector(path: Option<&Path>) -> Option<PathBuf> {
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let exe_path = env::current_exe().ok()?;
+            exe_path.parent()?.to_path_buf()
+        }
+    };
 
-    // find authlib injector
-    let current_exe = env::current_exe()?;
-    let exe_dir = current_exe.parent().unwrap();
-    let mut authlib_injector_path: PathBuf = PathBuf::new();
+    let is_filename_valid =
+        |filename: &str| filename.starts_with("authlib-injector") && filename.ends_with(".jar");
 
-    if let Ok(entries) = fs::read_dir(exe_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
+    fs::read_dir(path).ok().and_then(|entries| {
+        entries
+            .filter_map(IoResult::ok)
+            .find(|entry| {
                 let file_name = entry.file_name();
-                if let Some(file_name) = file_name.to_str() {
-                    if file_name.starts_with("authlib-injector") && file_name.ends_with(".jar") {
-                        authlib_injector_path = entry.path();
-                        break;
-                    }
-                }
+                file_name.to_str().map_or(false, is_filename_valid)
+            })
+            .map(|entry| entry.path())
+    })
+}
+
+fn generate_client_token() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn yggdrasil_login(
+    username: &str,
+    password: &str,
+    client_token: &str,
+    api_url: &str,
+) -> Result<LoginResult> {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(MmcaiError::ReqwestClientBuildFailed)?;
+
+    let get_prefetched_data = || -> ReqwestResult<String> {
+        let prefetched_data_text = client.get(api_url).send()?.text()?;
+        Ok(BASE64_STANDARD.encode(prefetched_data_text))
+    };
+
+    let perform_authentication = || -> ReqwestResult<AuthResponse> {
+        let mut headers = header::HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+
+        let body = AuthRequest {
+            username,
+            password,
+            request_user: true,
+            client_token,
+        };
+
+        Ok(client
+            .post(format!("{}/authserver/authenticate", api_url))
+            .headers(headers)
+            .json(&body)
+            .send()?
+            .json::<AuthResponse>()?)
+    };
+
+    let prefetched_data = get_prefetched_data().map_err(MmcaiError::YggdrasilHelloFailed)?;
+    let auth_response = perform_authentication().map_err(MmcaiError::YggdrasilAuthFailed)?;
+
+    Ok(LoginResult {
+        prefetched_data,
+        access_token: auth_response.access_token,
+        selected_profile: auth_response.selected_profile,
+    })
+}
+
+fn modify_minecraft_params(
+    minecraft_params: &mut Vec<String>,
+    access_token: &str,
+    uuid: &str,
+    playername: &str,
+) -> Result<()> {
+    for index in 0..minecraft_params.len() {
+        match minecraft_params[index].as_str() {
+            line if line.contains("param --username") => {
+                *minecraft_params
+                    .get_mut(index + 1)
+                    .ok_or(MmcaiError::Other)? = format!("param {}", playername).to_string();
             }
+            line if line.contains("param --uuid") => {
+                *minecraft_params
+                    .get_mut(index + 1)
+                    .ok_or(MmcaiError::Other)? = format!("param {}", uuid).to_string();
+            }
+            line if line.contains("param --accessToken") => {
+                *minecraft_params
+                    .get_mut(index + 1)
+                    .ok_or(MmcaiError::Other)? = format!("param {}", access_token).to_string();
+            }
+            line if line.contains("userName ") => {
+                *minecraft_params.get_mut(index).ok_or(MmcaiError::Other)? =
+                    format!("userName {}", playername).to_string();
+            }
+            line if line.contains("sessionId ") => {
+                *minecraft_params.get_mut(index).ok_or(MmcaiError::Other)? =
+                    format!("sessionId token:{}", access_token).to_string();
+            }
+            _ => {}
         }
     }
+    Ok(())
+}
 
-    if authlib_injector_path == PathBuf::new() {
-        eprintln!("[mmcai_rs] authlib-injector not found in the same directory as mmcai_rs!");
-        process::exit(1);
-    }
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+
+    validate_args(&args)?;
+
+    // find authlib-injector
+    let authlib_injector_path =
+        find_authlib_injector(None).ok_or(MmcaiError::AuthlibInjectorNotFound)?;
 
     println!(
         "[mmcai_rs] authlib-injector found at {:?}, logging in...",
@@ -72,38 +183,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let password = &args[2];
     let api_url = &args[3];
 
-    let mut rng = thread_rng();
-    let mut buffer = [0u8; 128];
-    rng.fill(&mut buffer);
-    let base64_encoded = BASE64_STANDARD.encode(&buffer);
-    let client_token = &base64_encoded[..128];
+    let client_token = generate_client_token();
 
-    let mut headers = header::HeaderMap::new();
-    headers.insert("Content-Type", "application/json".parse().unwrap());
-
-    let mut body: HashMap<&str, &str> = HashMap::new();
-    body.insert("username", username);
-    body.insert("password", password);
-    body.insert("requestUser", "true");
-    body.insert("clientToken", client_token);
-
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-
-    let hello_response_text = client.get(api_url).send()?.text()?;
-
-    let auth_response = client
-        .post(format!("{}/authserver/authenticate", api_url))
-        .headers(headers)
-        .json(&body)
-        .send()?
-        .json::<AuthResponse>()?;
+    let login_result = yggdrasil_login(username, password, &client_token, api_url)?;
 
     println!(
         "[mmcai_rs] Successfully authenticated as {}",
-        auth_response.selected_profile.name
+        login_result.selected_profile.name
     );
 
     // minecraft params
@@ -111,86 +197,184 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
-        let line = &line.expect("Failed to read Minecraft params");
-
+        let line = line
+            .map_err(MmcaiError::ReadMinecraftParamsFailed)?
+            .trim()
+            .to_string();
         minecraft_params.push(line.clone());
-
-        if line.trim() == "launch" {
+        if line == "launch" {
             break;
         }
     }
 
-    let access_token = auth_response.access_token;
-    let uuid = auth_response.selected_profile.id;
-    let playername = auth_response.selected_profile.name;
+    let access_token = login_result.access_token;
+    let uuid = login_result.selected_profile.id;
+    let playername = login_result.selected_profile.name;
 
-    for index in 0..minecraft_params.len() {
-        if minecraft_params[index].contains("param --username") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", playername).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("param --uuid") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", uuid).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("param --accessToken") {
-            if let Some(next_line) = minecraft_params.get_mut(index + 1) {
-                *next_line = format!("param {}", access_token).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("userName ") {
-            if let Some(this_line) = minecraft_params.get_mut(index) {
-                *this_line = format!("userName {}", playername).to_string();
-            }
-        }
-
-        if minecraft_params[index].contains("sessionId ") {
-            if let Some(this_line) = minecraft_params.get_mut(index) {
-                *this_line = format!("sessionId token:{}", access_token).to_string();
-            }
-        }
-    }
+    modify_minecraft_params(&mut minecraft_params, &access_token, &uuid, &playername)?;
 
     // ready to launch
-    let prefetched_data = BASE64_STANDARD.encode(hello_response_text);
-    let java_executable = env::var("INST_JAVA").unwrap();
+    let java_executable = env::var("INST_JAVA").map_err(|_| MmcaiError::JavaExecutableNotFound)?;
+
     let mut jvm_args = Vec::from(&args[5..]);
     jvm_args.insert(
         0,
         format!(
             "-javaagent:{}={}",
-            authlib_injector_path.to_str().unwrap(),
+            authlib_injector_path.to_str().ok_or(MmcaiError::Other)?,
             api_url
         ),
     );
     jvm_args.insert(
         1,
-        format!("-Dauthlibinjector.yggdrasil.prefetched={}", prefetched_data),
+        format!(
+            "-Dauthlibinjector.yggdrasil.prefetched={}",
+            login_result.prefetched_data
+        ),
     );
+
+    #[cfg(debug_assertions)]
+    {
+        println!("[mmcai_rs] args: {:?}", args);
+        println!("[mmcai_rs] java_executable: {:?}", java_executable);
+        println!("[mmcai_rs] jvm_args: {:?}", jvm_args);
+        println!("[mmcai_rs] minecraft_params: {:?}", minecraft_params);
+    }
 
     let mut command = process::Command::new(java_executable);
     command.args(jvm_args);
 
-    if let Ok(mut child) = command
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .spawn()
-    {
-        let child_stdin = &mut child.stdin;
+        .map_err(MmcaiError::SpawnProcessFailed)?;
 
-        if let Some(stdin) = child_stdin {
-            for line in minecraft_params {
-                writeln!(stdin, "{}", line).expect("Failed to write Minecraft params");
-            }
-        }
+    let stdin = (&mut child.stdin)
+        .as_mut()
+        .ok_or(MmcaiError::StdinUnavailable)?;
 
-        let _ = child.wait();
+    minecraft_params.iter().for_each(|line| {
+        let _ = writeln!(stdin, "{}", line).map_err(MmcaiError::WriteMinecraftParamsFailed);
+    });
+
+    let status = child.wait().map_err(|_| MmcaiError::Other)?;
+
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_fs::prelude::{FileTouch, PathChild};
+    use fake::{Fake, Faker};
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    use super::*;
+
+    fn get_fake_args(length: usize) -> Vec<String> {
+        let seed = [
+            1, 0, 0, 0, 23, 0, 0, 0, 200, 1, 0, 0, 210, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ];
+        let ref mut r = StdRng::from_seed(seed);
+        (0..length)
+            .map(|_| Faker.fake_with_rng::<String, _>(r))
+            .collect()
+    }
+
+    #[test]
+    fn test_validate_args() {
+        assert!(matches!(
+            validate_args(&get_fake_args(1)),
+            Err(MmcaiError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            validate_args(&get_fake_args(2)),
+            Err(MmcaiError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            validate_args(&get_fake_args(3)),
+            Err(MmcaiError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            validate_args(&get_fake_args(4)),
+            Err(MmcaiError::CannotRunDirectly)
+        ));
+        assert!(matches!(validate_args(&get_fake_args(5)), Ok(())));
+    }
+
+    #[test]
+    fn test_generate_client_token() {
+        let client_token = generate_client_token();
+        assert_eq!(client_token.len(), 36);
+    }
+
+    #[test]
+    fn test_find_authlib_injector() {
+        let test_find_authlib_injector_with_filename = |filename: &str, should_exist: bool| {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let input_file = temp_dir.child(filename);
+            input_file.touch().unwrap();
+            if should_exist {
+                assert_eq!(
+                    find_authlib_injector(Some(&temp_dir)).unwrap(),
+                    input_file.path()
+                );
+            } else {
+                assert!(find_authlib_injector(Some(&temp_dir)).is_none());
+            }
+            temp_dir.close().unwrap();
+        };
+
+        test_find_authlib_injector_with_filename("authlib-injector-1.0.0.jar", true);
+        test_find_authlib_injector_with_filename("authlib-injector-1.0.0.zip", false);
+        test_find_authlib_injector_with_filename("authlib-injector-1.0.0", false);
+        test_find_authlib_injector_with_filename("authlib-injector-.catch.me.if.you.can.jar", true);
+        test_find_authlib_injector_with_filename("not-start-with.authlib-injector.jar", false);
+        test_find_authlib_injector_with_filename("authlib-injector.jar.not-end-with", false);
+    }
+
+    #[test]
+    fn test_modify_minecraft_params() {
+        let mut minecraft_params = vec![
+            "---START---".to_string(),
+            "param --username".to_string(),
+            "param AnyHow".to_string(),
+            "param --uuid".to_string(),
+            "param AnyHow".to_string(),
+            "param --accessToken".to_string(),
+            "param AnyHow".to_string(),
+            "userName AnyHow".to_string(),
+            "sessionId AnyHow".to_string(),
+            "launch".to_string(),
+            "---END---".to_string(),
+        ];
+        let access_token = "TEST_ACCESS_TOKEN";
+        let uuid = "TEST_UUID";
+        let playername = "TEST_PLAYERNAME";
+        modify_minecraft_params(&mut minecraft_params, access_token, uuid, playername).unwrap();
+        assert_eq!(
+            minecraft_params,
+            vec![
+                "---START---".to_string(),
+                "param --username".to_string(),
+                "param TEST_PLAYERNAME".to_string(),
+                "param --uuid".to_string(),
+                "param TEST_UUID".to_string(),
+                "param --accessToken".to_string(),
+                "param TEST_ACCESS_TOKEN".to_string(),
+                "userName TEST_PLAYERNAME".to_string(),
+                "sessionId token:TEST_ACCESS_TOKEN".to_string(),
+                "launch".to_string(),
+                "---END---".to_string(),
+            ]
+        );
+    }
+
+    // XXX: key features are not tested
 }

@@ -26,6 +26,33 @@ struct AuthRequest<'a> {
     password: &'a str,
     request_user: bool,
     client_token: &'a str,
+    agent: Agent<'a>,
+}
+impl Default for AuthRequest<'_> {
+    fn default() -> Self {
+        AuthRequest {
+            username: "",
+            password: "",
+            request_user: true,
+            client_token: "",
+            agent: Agent::default(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Agent<'a> {
+    name: &'a str,
+    version: i32,
+}
+impl Default for Agent<'_> {
+    fn default() -> Self {
+        Agent {
+            name: "Minecraft",
+            version: 1,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -35,19 +62,20 @@ struct AuthResponse {
     selected_profile: Profile,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct Profile {
     id: String,
     name: String,
 }
 
+#[derive(Debug)]
 struct LoginResult {
     prefetched_data: String,
     access_token: String,
     selected_profile: Profile,
 }
 
-fn validate_args(args: &Vec<String>) -> Result<()> {
+fn validate_args(args: &[String]) -> Result<()> {
     match args.len() {
         len if len < 4 => Err(MmcaiError::InvalidArgument(args[0].to_owned())),
         4 => Err(MmcaiError::CannotRunDirectly),
@@ -105,16 +133,16 @@ fn yggdrasil_login(
         let body = AuthRequest {
             username,
             password,
-            request_user: true,
             client_token,
+            ..AuthRequest::default()
         };
 
-        Ok(client
+        client
             .post(format!("{}/authserver/authenticate", api_url))
             .headers(headers)
             .json(&body)
             .send()?
-            .json::<AuthResponse>()?)
+            .json::<AuthResponse>()
     };
 
     let prefetched_data = get_prefetched_data().map_err(MmcaiError::YggdrasilHelloFailed)?;
@@ -128,7 +156,7 @@ fn yggdrasil_login(
 }
 
 fn modify_minecraft_params(
-    minecraft_params: &mut Vec<String>,
+    minecraft_params: &mut [String],
     access_token: &str,
     uuid: &str,
     playername: &str,
@@ -250,9 +278,7 @@ fn main() -> Result<()> {
         .spawn()
         .map_err(MmcaiError::SpawnProcessFailed)?;
 
-    let stdin = (&mut child.stdin)
-        .as_mut()
-        .ok_or(MmcaiError::StdinUnavailable)?;
+    let stdin = child.stdin.as_mut().ok_or(MmcaiError::StdinUnavailable)?;
 
     minecraft_params.iter().for_each(|line| {
         let _ = writeln!(stdin, "{}", line).map_err(MmcaiError::WriteMinecraftParamsFailed);
@@ -281,7 +307,7 @@ mod tests {
             1, 0, 0, 0, 23, 0, 0, 0, 200, 1, 0, 0, 210, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0,
         ];
-        let ref mut r = StdRng::from_seed(seed);
+        let r = &mut StdRng::from_seed(seed);
         (0..length)
             .map(|_| Faker.fake_with_rng::<String, _>(r))
             .collect()

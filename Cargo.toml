@@ -1,6 +1,6 @@
 [package]
 name = "mmcai_rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [profile.release]
@@ -11,13 +11,13 @@ opt-level = "z"
 panic = "abort"
 
 [dependencies]
-base64 = "0.22.0"
-reqwest = { version = "0.11.24", features = ["blocking", "json"] }
-serde = { version = "1.0.197", features = ["derive"] }
-thiserror = "1.0.57"
-uuid = { version = "1.7.0", features = ["v4"] }
+base64 = "0.22.1"
+reqwest = { version = "0.12.12", features = ["blocking", "json"] }
+serde = { version = "1.0.218", features = ["derive"] }
+thiserror = "2.0.11"
+uuid = { version = "1.15.1", features = ["v4"] }
 
 [dev-dependencies]
-rand = "0.8.5"
-assert_fs = "1.1.1"
-fake = "2.9.2"
+rand = "0.9.0"
+assert_fs = "1.1.2"
+fake = "4.0.0"
